@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Runtime stats (generated, not source)
+.stats.json
+.stats.json.tmp
+
+# Editor / OS files
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local
+
+# Test output
+/tmp/
+*.log
+node_modules

@@ -1,0 +1,75 @@
+{
+  "id": "context-distiller",
+  "uiHints": {
+    "enabled": {
+      "label": "Enable Distillation",
+      "help": "Enable or disable the context distiller plugin"
+    },
+    "toolOutputMaxTokens": {
+      "label": "Tool Output Max Tokens",
+      "help": "Maximum tokens for a single tool output before distillation kicks in (default: 800)"
+    },
+    "patchMaxTokens": {
+      "label": "Patch Max Tokens",
+      "help": "Maximum tokens for patch/diff content before summarization (default: 600)"
+    },
+    "fileContentMaxTokens": {
+      "label": "File Content Max Tokens",
+      "help": "Maximum tokens for inline file content before truncation (default: 1000)"
+    },
+    "aggressiveness": {
+      "label": "Distillation Aggressiveness",
+      "help": "How aggressively to distill content: 'conservative' keeps more detail, 'moderate' balances, 'aggressive' maximizes compression"
+    },
+    "preservePatterns": {
+      "label": "Preserve Patterns",
+      "help": "Regex patterns for content that should never be distilled (comma-separated)"
+    },
+    "distillModel": {
+      "label": "Distill Model",
+      "help": "Model override for LLM-powered distillation (e.g., 'ollama/qwen3:8b'). Falls back to system default."
+    },
+    "distillProvider": {
+      "label": "Distill Provider",
+      "help": "Provider override for distillation LLM calls"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "toolOutputMaxTokens": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 5000
+      },
+      "patchMaxTokens": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 3000
+      },
+      "fileContentMaxTokens": {
+        "type": "integer",
+        "minimum": 200,
+        "maximum": 5000
+      },
+      "aggressiveness": {
+        "type": "string",
+        "enum": ["conservative", "moderate", "aggressive"]
+      },
+      "preservePatterns": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "distillModel": {
+        "type": "string"
+      },
+      "distillProvider": {
+        "type": "string"
+      }
+    }
+  }
+}
