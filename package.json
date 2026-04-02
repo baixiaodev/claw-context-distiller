@@ -1,6 +1,6 @@
 {
   "name": "context-distiller",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Intelligent context distillation plugin for OpenClaw — reduces context noise by compressing verbose tool outputs, patches, and file content before LCM ingestion. Saves 65-85% tokens on average.",
   "type": "module",
   "main": "index.ts",

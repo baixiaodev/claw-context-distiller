@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-02
+
+### Added
+
+- **Layered Recall** for oversized user/assistant messages
+- **Representative Samples** fallback for low-signal long messages
+- Section splitting support for labeled separators such as `--- Section 2 ---`
+- Structured keypoint extraction for:
+  - table headers
+  - env/config lines (`KEY=value`)
+  - path/grep/compiler/traceback lines
+  - CSV/TSV/pipe-style field headers
+- Content-aware Layered Recall routing via `analyzeContent()`
+- Summary budget cap for Layered Recall
+- Lightweight subtype summarizers for:
+  - env/config-like output
+  - kubectl pod listings
+  - docker image listings
+  - du-like directory size listings
+  - CSV-like tabular content
+  - docker build logs
+  - Terraform plan summaries
+  - git status output
+  - lsof output
+- `KNOWN_LIMITATIONS.md` user-facing limitations document
+
+### Changed
+
+- Improved Section Index quality for long pasted logs
+- Reduced low-information envelopes in long-message handling
+- Better preservation of structured signal under heavy compression
+- Better control of overlong summaries in Layered Recall
+- Updated quality benchmark model to score Keypoint Summary, Representative Samples, Section Index, and summary budget compliance together
+
+### Quality
+
+Long-message quality progression across internal 30-case evaluation:
+
+| Stage | KP Coverage | Weak Envelopes |
+|---|---:|---:|
+| Previous baseline | 6/30 | 24 |
+| P0 | 14/30 | 16 |
+| P1 | 19/30 | 11 |
+| P2-A | 21/30 | 9 |
+| P2-B | 23/30 | 7 |
+| Final scored benchmark | **23/30 KP, 0/30 weak** |
+
 ## [0.1.0] - 2026-03-21
 
 ### Added

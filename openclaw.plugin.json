@@ -17,6 +17,14 @@
       "label": "File Content Max Tokens",
       "help": "Maximum tokens for inline file content before truncation (default: 1000)"
     },
+    "messageMaxTokens": {
+      "label": "Message Max Tokens",
+      "help": "Maximum tokens for oversized user/assistant messages before Layered Recall activates (default: 3000)"
+    },
+    "messageSummaryMaxLines": {
+      "label": "Message Summary Max Lines",
+      "help": "Maximum number of summary lines kept inside Layered Recall envelopes (default: 40)"
+    },
     "aggressiveness": {
       "label": "Distillation Aggressiveness",
       "help": "How aggressively to distill content: 'conservative' keeps more detail, 'moderate' balances, 'aggressive' maximizes compression"

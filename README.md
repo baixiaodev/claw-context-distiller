@@ -1,6 +1,6 @@
 # context-distiller
 
-> Intelligent context distillation plugin for [OpenClaw](https://github.com/nicepkg/openclaw) — reduces context noise by compressing verbose tool outputs, patches, and file content before they enter the context window.
+> Intelligent context distillation plugin for [OpenClaw](https://github.com/nicepkg/openclaw) — reduces context noise by compressing verbose tool outputs, patches, file content, and oversized user/assistant messages before they enter the context window.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![OpenClaw Plugin](https://img.shields.io/badge/OpenClaw-Plugin-blue)](https://github.com/nicepkg/openclaw)
@@ -16,6 +16,10 @@ When AI agents work on complex tasks, they generate massive amounts of context: 
 - **Higher costs** — more tokens = more money
 
 **context-distiller** hooks into OpenClaw's message pipeline and compresses verbose content *before* it enters the context engine. Think of it as a smart filter that keeps the important bits and throws away the noise.
+
+In the current version, this now applies to two major paths:
+- **tool_result_persist** for verbose tool output
+- **before_message_write** for oversized user/assistant messages via **Layered Recall**
 
 ### Results from real-world testing (20 research scenarios):
 
@@ -45,13 +49,15 @@ User Query → Agent → Tool Call → Tool Result
                         └────────────┬────────────┘
                                      ↓
                         ┌─────────────────────────┐
-                        │  before_message_write    │  ← sync hook (safety net)
-                        │  catches remaining       │
-                        │  verbose tool messages   │
+                        │  before_message_write    │  ← sync hook (secondary path)
+                        │                         │
+                        │  Path 1: tool messages   │  head+tail safety net
+                        │  Path 2: large user/     │  Layered Recall envelope
+                        │          assistant msgs  │
                         └────────────┬────────────┘
                                      ↓
-                           Context Engine (LCM)
-                         e.g. lossless-claw
+                          Context Engine (LCM)
+                        e.g. lossless-claw
 ```
 
 ### Design Principles
@@ -130,6 +136,8 @@ Add the following to your `openclaw.json`:
           "toolOutputMaxTokens": 1200,
           "patchMaxTokens": 600,
           "fileContentMaxTokens": 1000,
+          "messageMaxTokens": 3000,
+          "messageSummaryMaxLines": 40,
           "aggressiveness": "moderate",
           "distillModel": "ollama/qwen3:8b"  // optional, for LLM-powered summarization
         }
@@ -179,6 +187,8 @@ Or ask your agent:
 | `toolOutputMaxTokens` | `1200` | 100–5000 | Threshold for tool output distillation |
 | `patchMaxTokens` | `600` | 100–3000 | Threshold for diff/patch distillation |
 | `fileContentMaxTokens` | `1000` | 200–5000 | Threshold for file content distillation |
+| `messageMaxTokens` | `3000` | 500–10000 | Threshold for Layered Recall on oversized user/assistant messages |
+| `messageSummaryMaxLines` | `40` | 5–200 | Max summary lines retained inside Layered Recall envelopes |
 | `aggressiveness` | `"moderate"` | conservative / moderate / aggressive | Controls compression intensity |
 | `preservePatterns` | `[]` | Array of regex strings | Content matching these patterns is never distilled |
 | `distillModel` | `"ollama/qwen3:8b"` | Any model ref | Model for LLM-powered summarization (optional) |
@@ -298,6 +308,32 @@ Reading entire config files (package.json, openclaw.json, Terraform .tf). contex
 
 ---
 
+## Layered Recall
+
+For oversized user/assistant messages, context-distiller now builds a structured envelope instead of passing the full raw message directly into context.
+
+Depending on the content, the envelope may include:
+- **Keypoint Summary**
+- **Representative Samples**
+- **Section Index**
+- **Full-text Access** pointer
+
+This is designed to preserve compact, actionable understanding — not a lossless mirror of the original message.
+
+### Long-message quality snapshot
+
+| Metric | Result |
+|---|---:|
+| Keypoint Summary coverage | 23/30 |
+| Representative Samples coverage | 7/30 |
+| Multi-section coverage | 30/30 |
+| Summary budget compliance | 30/30 |
+| High-information envelopes | 13/30 |
+| Medium-information envelopes | 17/30 |
+| Weak envelopes | 0/30 |
+
+---
+
 ## Working with Other Plugins
 
 ### With lossless-claw (Context Engine)
@@ -361,6 +397,8 @@ The plugin detects search results by JSON structure heuristics (url + title + sn
 ### 6. Gateway Agent Timeout (~300s)
 
 For complex research tasks that take >5 minutes, the Gateway may timeout the agent response while the agent is still working. This is a Gateway-level issue (not a context-distiller issue) but affects the end-to-end experience. See [Gateway Agent Timeout](#gateway-agent-timeout) section.
+
+For the current user-facing limitation set, also see [`KNOWN_LIMITATIONS.md`](./KNOWN_LIMITATIONS.md).
 
 ---
 
