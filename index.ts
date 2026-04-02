@@ -22,6 +22,7 @@ import type { OpenClawPluginApi, AnyAgentTool } from "openclaw/plugin-sdk";
 import { resolveConfig, getAggressivenessMultiplier } from "./src/config.js";
 import { DistillerEngine, classifyContent } from "./src/distiller.js";
 import { estimateTokens, truncateToTokenBudget } from "./src/tokens.js";
+import { testDistillerTool } from "./src/tools/test-tool.js";
 import {
   toolOutputTruncationRule,
   patchDistillRule,
@@ -825,7 +826,7 @@ function syncTryJsonSummary(content: string, maxTokens: number): string | null {
       ].join("\n");
 
       const resultTokens = estimateTokens(result);
-      if (resultTokens < tokens * 0.9) return result;
+      if (resultTokens < estimateTokens(trimmed) * 0.9) return result;
     }
   }
 
@@ -1572,6 +1573,532 @@ function distillSync(
   return null;
 }
 
+// ── Layered Recall: summary + section index + full-text access ──────────
+//
+// For large user/assistant messages (e.g. memory-reflection injection),
+// instead of naive truncation, we produce a structured envelope that lets
+// the agent understand the gist without losing access to the full content.
+//
+// The envelope contains:
+// 1. Summary — keypoint extraction from the original text (sync, rule-based)
+// 2. Section Index — logical segment map with topic + line range
+// 3. Full-text Access — session file path + timestamp for on-demand retrieval
+//
+// This way the agent can "understand" the message's purpose and decide
+// whether to retrieve the full text via read_file.
+
+interface SectionEntry {
+  startLine: number;
+  endLine: number;
+  heading?: string;
+  topic: string;
+  chars: number;
+}
+
+/**
+ * Split content into logical sections based on structural cues.
+ * Returns an array of SectionEntry with approximate line ranges and topic hints.
+ */
+function syncBuildSectionIndex(content: string): SectionEntry[] {
+  const lines = content.split("\n");
+  const sections: SectionEntry[] = [];
+  let currentStart = 0;
+  let currentHeading: string | undefined;
+  let currentTopicLines: string[] = [];
+  let currentChars = 0;
+
+  const flush = (endLine: number) => {
+    if (endLine > currentStart) {
+      const topic = currentHeading
+        || currentTopicLines.filter(l => l.trim().length > 20).slice(0, 2).join(" ").trim()
+        || "(unlabeled section)";
+      sections.push({
+        startLine: currentStart + 1,
+        endLine,
+        heading: currentHeading || undefined,
+        topic: topic.length > 120 ? topic.slice(0, 117) + "..." : topic,
+        chars: currentChars,
+      });
+    }
+    currentStart = endLine;
+    currentHeading = undefined;
+    currentTopicLines = [];
+    currentChars = 0;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    currentChars += line.length + 1;
+
+    const headingMatch = line.match(/^(#{1,4})\s+(.+)/);
+    if (headingMatch) {
+      flush(i);
+      currentHeading = headingMatch[2].trim();
+      currentStart = i;
+      continue;
+    }
+
+    const labeledSeparatorMatch = line.match(/^[-=]{3,}\s*(.+?)\s*[-=]{3,}$/);
+    if (labeledSeparatorMatch && i > currentStart + 2) {
+      flush(i);
+      currentHeading = labeledSeparatorMatch[1].trim();
+      currentStart = i;
+      continue;
+    }
+
+    if (trimmed === "```" && i > currentStart + 3) {
+      continue;
+    }
+
+    if (line.match(/^---+$|^===+$/) && i > currentStart + 2) {
+      flush(i);
+      continue;
+    }
+
+    if (
+      currentTopicLines.length < 3 &&
+      trimmed.length > 10 &&
+      !line.startsWith("#") &&
+      !line.startsWith("```")
+    ) {
+      currentTopicLines.push(trimmed);
+    }
+  }
+
+  flush(lines.length);
+  return sections;
+}
+
+/**
+ * Extract keypoint summary from content lines.
+ * Uses a sync, rule-based approach: picks high-signal lines
+ * (headings, bullet points, lines with key patterns) while
+ * deduplicating similar lines.
+ *
+ * Returns a formatted summary string, or null if extraction fails.
+ */
+function syncExtractKeypointSummary(
+  content: string,
+  maxLines: number,
+): string | null {
+  const lines = content.split("\n");
+  if (lines.length < 8) return null;
+
+  const keypointSet = new Set<string>();
+  const keypointLines: string[] = [];
+
+  const pushKeypoint = (value: string, dedupeKey?: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    const normalized = (dedupeKey ?? trimmed).slice(0, 120).toLowerCase();
+    if (keypointSet.has(normalized)) return;
+    keypointSet.add(normalized);
+    keypointLines.push(trimmed.length > 220 ? trimmed.slice(0, 217) + "..." : trimmed);
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (/^#{1,4}\s+/.test(trimmed)) {
+      const heading = trimmed.replace(/^#+\s*/, "");
+      if (heading.length > 2) pushKeypoint(trimmed, heading);
+      if (keypointLines.length >= maxLines) break;
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(trimmed) || /^\d+[.)]\s+/.test(trimmed)) {
+      const normalized = trimmed.replace(/^[-*\d.)\s]+/, "");
+      if (normalized.length > 10) pushKeypoint(trimmed, normalized);
+      if (keypointLines.length >= maxLines) break;
+      continue;
+    }
+
+    // Structured table headers, e.g. NAME READY STATUS / COMMAND PID USER
+    if (/^[A-Z][A-Z0-9_./ -]{3,}(?:\s{2,}|\t)[A-Z][A-Z0-9_./ -]{2,}/.test(trimmed)) {
+      pushKeypoint(`[table] ${trimmed}`, `table:${trimmed}`);
+      if (keypointLines.length >= maxLines) break;
+      continue;
+    }
+
+    // KEY=value env/config lines
+    if (/^[A-Z_][A-Z0-9_]*=/.test(trimmed)) {
+      const key = trimmed.split("=")[0] ?? "";
+      if (/^(PATH|HOME|PWD|USER|SHELL|LANG|NODE_ENV|DATABASE_URL|REDIS_URL|OPENCLAW_|CONTEXT_DISTILLER_)/.test(key)) {
+        pushKeypoint(trimmed, `env:${key}`);
+        if (keypointLines.length >= maxLines) break;
+        continue;
+      }
+    }
+
+    // file:line content / grep / compiler / stack samples
+    if (
+      /^\S+\.\w+:\d+(?::\d+)?[: ]/.test(trimmed) ||
+      /^File\s+".+",\s+line\s+\d+/.test(trimmed) ||
+      /^(\.\/|\/|[A-Za-z]:\\)/.test(trimmed)
+    ) {
+      pushKeypoint(trimmed, `path:${trimmed.replace(/\d+/g, "#")}`);
+      if (keypointLines.length >= maxLines) break;
+      continue;
+    }
+
+    // CSV / TSV / pipe header-like lines
+    if ((trimmed.match(/,/g)?.length ?? 0) >= 3 || (trimmed.match(/\|/g)?.length ?? 0) >= 3 || (trimmed.match(/\t/g)?.length ?? 0) >= 2) {
+      const fieldCount = Math.max(
+        trimmed.split(",").length,
+        trimmed.split("|").length,
+        trimmed.split("\t").length,
+      );
+      if (fieldCount >= 4 && !/^\d/.test(trimmed)) {
+        pushKeypoint(`[fields] ${trimmed}`, `fields:${trimmed}`);
+        if (keypointLines.length >= maxLines) break;
+        continue;
+      }
+    }
+
+    if (/(?:decided|confirmed|fixed|changed|updated|created|deleted|error|fail|success|result|conclusion|note|important|warning|assertion|exception|traceback|timeout|deprecated|vulnerab|compiled successfully|passing|failing|plan:|found \d+ errors?)/i.test(trimmed)) {
+      pushKeypoint(trimmed);
+    }
+
+    if (keypointLines.length >= maxLines) break;
+  }
+
+  if (keypointLines.length < 3) return null;
+  return keypointLines.join("\n");
+}
+
+/**
+ * Build the layered-recall envelope for a large message.
+ *
+ * @param content The original message content
+ * @param role The message role (user/assistant)
+ * @param sessionId Optional session ID for full-text access pointer
+ * @param timestamp Optional timestamp for provenance
+ * @param config Distiller config (for thresholds)
+ * @returns The compressed envelope string, or null if no compression needed
+ */
+function syncLayeredRecall(
+  content: string,
+  role: string,
+  sessionId?: string,
+  timestamp?: string,
+  config?: DistillerConfig,
+): { envelope: string; rule: string } | null {
+  const tokens = estimateTokens(content);
+  const threshold = config?.messageMaxTokens ?? 3000;
+  const maxSummaryLines = config?.messageSummaryMaxLines ?? 40;
+
+  if (tokens <= threshold) return null;
+
+  const lines = content.split("\n");
+  const totalLines = lines.length;
+  const totalChars = content.length;
+  const sections = syncBuildSectionIndex(content);
+  const analysis = analyzeContent(content);
+
+  const summaryBudget = Math.max(200, Math.round(threshold * 0.45));
+  const activeConfig = config ?? {
+    enabled: true,
+    toolOutputMaxTokens: 1200,
+    patchMaxTokens: 600,
+    fileContentMaxTokens: 1000,
+    messageMaxTokens: 3000,
+    messageSummaryMaxLines: 40,
+    aggressiveness: "moderate" as const,
+    preservePatterns: [],
+    distillModel: undefined,
+    distillProvider: undefined,
+  };
+
+  const capSummary = (value: string | null | undefined): string | null => {
+    if (!value?.trim()) return null;
+    const cappedLines = value.split("\n").slice(0, maxSummaryLines).join("\n");
+    return estimateTokens(cappedLines) <= summaryBudget
+      ? cappedLines
+      : truncateToTokenBudget(cappedLines, summaryBudget);
+  };
+
+  let summary = capSummary(syncExtractKeypointSummary(content, maxSummaryLines));
+
+  const extractRepresentativeSamples = (allLines: string[], maxSamples = 6): string[] => {
+    const candidates = allLines
+      .map(l => l.trim())
+      .filter(l => l && l.length > 5 && !/^[-=]{3,}\s*.*\s*[-=]{3,}$/.test(l));
+    if (candidates.length === 0) return [];
+
+    const indexes = [0, Math.floor(candidates.length / 4), Math.floor(candidates.length / 2), Math.floor(candidates.length * 3 / 4), candidates.length - 1];
+    const unique = [...new Set(indexes)]
+      .filter(i => i >= 0 && i < candidates.length)
+      .slice(0, maxSamples);
+
+    const seen = new Set<string>();
+    const samples: string[] = [];
+    for (const idx of unique) {
+      const value = candidates[idx];
+      const normalized = value.replace(/\d+/g, "#").slice(0, 140).toLowerCase();
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      samples.push(value.length > 220 ? value.slice(0, 217) + "..." : value);
+      if (samples.length >= maxSamples) break;
+    }
+    return samples;
+  };
+
+  const summarizeEnvLike = (text: string): string | null => {
+    const envLines = text.split("\n").map(l => l.trim()).filter(l => /^[A-Z_][A-Z0-9_]*=/.test(l));
+    if (envLines.length < 5) return null;
+    const preferred = envLines.filter(l => /^(PATH|HOME|PWD|USER|SHELL|LANG|NODE_ENV|DATABASE_URL|REDIS_URL|OPENCLAW_|CONTEXT_DISTILLER_)/.test(l));
+    const sample = (preferred.length > 0 ? preferred : envLines).slice(0, 8);
+    return [`[Environment-like output: ${envLines.length} variables]`, ...sample].join("\n");
+  };
+
+  const summarizeDockerImagesLike = (text: string): string | null => {
+    const rows = text.split("\n").filter(l => l.trim());
+    if (rows.length < 4 || !/^REPOSITORY\s+TAG\s+IMAGE ID/i.test(rows[0])) return null;
+    const images = rows.slice(1);
+    return [
+      `[Docker images: ${images.length} entries]`,
+      ...images.slice(0, 5),
+      ...(images.length > 5 ? [`... and ${images.length - 5} more images`] : []),
+    ].join("\n");
+  };
+
+  const summarizeKubectlPodsLike = (text: string): string | null => {
+    const rows = text.split("\n").filter(l => l.trim());
+    if (rows.length < 4 || !/^NAME\s+READY\s+STATUS/i.test(rows[0])) return null;
+    const pods = rows.slice(1);
+    const statuses = new Map<string, number>();
+    for (const row of pods) {
+      const cols = row.trim().split(/\s+/);
+      const status = cols[2] ?? "unknown";
+      statuses.set(status, (statuses.get(status) ?? 0) + 1);
+    }
+    return [
+      `[Kubernetes pods: ${pods.length} entries]`,
+      `Statuses: ${[...statuses.entries()].map(([k, v]) => `${k}(${v})`).join(", ")}`,
+      ...pods.slice(0, 5),
+      ...(pods.length > 5 ? [`... and ${pods.length - 5} more pods`] : []),
+    ].join("\n");
+  };
+
+  const summarizeDuLike = (text: string): string | null => {
+    const rows = text.split("\n").map(l => l.trim()).filter(l => /^\S+\s+\.?\//.test(l) || /^\S+\s+\.$/.test(l));
+    if (rows.length < 5) return null;
+    return [`[Directory size listing: ${rows.length} entries]`, ...rows.slice(0, 6)].join("\n");
+  };
+
+  const summarizeCsvLike = (text: string): string | null => {
+    const rows = text.split("\n").map(l => l.trim()).filter(Boolean);
+    if (rows.length < 5) return null;
+    const header = rows[0];
+    const delim = (header.match(/,/g)?.length ?? 0) >= 3 ? ","
+      : (header.match(/\|/g)?.length ?? 0) >= 3 ? "|"
+      : (header.match(/\t/g)?.length ?? 0) >= 2 ? "\t"
+      : null;
+    if (!delim) return null;
+    const columns = header.split(delim).map(v => v.trim()).filter(Boolean);
+    if (columns.length < 4) return null;
+    return [
+      `[Tabular data: ${Math.max(0, rows.length - 1)} rows × ${columns.length} columns]`,
+      `Columns: ${columns.slice(0, 10).join(", ")}`,
+      ...rows.slice(1, 4),
+      ...(rows.length > 4 ? [`... and ${rows.length - 4} more row(s)`] : []),
+    ].join("\n");
+  };
+
+  const summarizeDockerBuildLike = (text: string): string | null => {
+    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    const stepLines = lines.filter(l => /^Step\s+\d+\/\d+\s*:/.test(l));
+    if (stepLines.length < 3) return null;
+    const finalLine = lines.find(l => /compiled successfully|Successfully built|Successfully tagged|build complete/i.test(l));
+    return [
+      `[Docker build log: ${stepLines.length} step(s)]`,
+      ...stepLines.slice(0, 5),
+      ...(finalLine ? [`Result: ${finalLine}`] : []),
+      ...(stepLines.length > 5 ? [`... and ${stepLines.length - 5} more step(s)`] : []),
+    ].join("\n");
+  };
+
+  const summarizeTerraformPlanLike = (text: string): string | null => {
+    const rows = text.split("\n");
+    const planLine = rows.find(l => /^Plan:\s+\d+\s+to add,\s+\d+\s+to change,\s+\d+\s+to destroy\.?$/i.test(l.trim()));
+    if (!planLine) return null;
+    const resources = rows.map(l => l.trim()).filter(l => /^#\s+.+\s+will be\s+/.test(l));
+    return [
+      `[Terraform plan summary]`,
+      planLine.trim(),
+      ...resources.slice(0, 5),
+      ...(resources.length > 5 ? [`... and ${resources.length - 5} more resource change(s)`] : []),
+    ].join("\n");
+  };
+
+  const summarizeGitStatusLike = (text: string): string | null => {
+    if (!/On branch\s+/i.test(text) || !/Changes not staged for commit|Untracked files/i.test(text)) return null;
+    const rows = text.split("\n").map(l => l.trim()).filter(Boolean);
+    const branch = rows.find(l => /^On branch\s+/i.test(l));
+    const modified = rows.filter(l => /^modified:\s+/.test(l));
+    const untrackedHeaderIdx = rows.findIndex(l => /^Untracked files:/i.test(l));
+    const untracked = untrackedHeaderIdx >= 0
+      ? rows.slice(untrackedHeaderIdx + 1).filter(l => !/^(use |no changes added|\(|On branch|Your branch)/i.test(l)).slice(0, 6)
+      : [];
+    return [
+      `[git status summary]`,
+      ...(branch ? [branch] : []),
+      `Modified: ${modified.length}`,
+      `Untracked: ${untracked.length}`,
+      ...modified.slice(0, 5),
+      ...untracked.slice(0, 3),
+    ].join("\n");
+  };
+
+  const summarizeLsofLike = (text: string): string | null => {
+    const rows = text.split("\n").map(l => l.trim()).filter(Boolean);
+    if (rows.length < 4 || !/^COMMAND\s+PID\s+USER\s+FD/i.test(rows[0])) return null;
+    const entries = rows.slice(1);
+    return [
+      `[lsof output: ${entries.length} descriptors]`,
+      ...entries.slice(0, 5),
+      ...(entries.length > 5 ? [`... and ${entries.length - 5} more descriptor(s)`] : []),
+    ].join("\n");
+  };
+
+  if (!summary) {
+    const envSummary = summarizeEnvLike(content);
+    if (envSummary) summary = capSummary(envSummary);
+  }
+
+  if (!summary) {
+    const k8sSummary = summarizeKubectlPodsLike(content);
+    if (k8sSummary) summary = capSummary(k8sSummary);
+  }
+
+  if (!summary) {
+    const dockerImagesSummary = summarizeDockerImagesLike(content);
+    if (dockerImagesSummary) summary = capSummary(dockerImagesSummary);
+  }
+
+  if (!summary) {
+    const duSummary = summarizeDuLike(content);
+    if (duSummary) summary = capSummary(duSummary);
+  }
+
+  if (!summary) {
+    const csvSummary = summarizeCsvLike(content);
+    if (csvSummary) summary = capSummary(csvSummary);
+  }
+
+  if (!summary) {
+    const dockerBuildSummary = summarizeDockerBuildLike(content);
+    if (dockerBuildSummary) summary = capSummary(dockerBuildSummary);
+  }
+
+  if (!summary) {
+    const terraformSummary = summarizeTerraformPlanLike(content);
+    if (terraformSummary) summary = capSummary(terraformSummary);
+  }
+
+  if (!summary) {
+    const gitStatusSummary = summarizeGitStatusLike(content);
+    if (gitStatusSummary) summary = capSummary(gitStatusSummary);
+  }
+
+  if (!summary) {
+    const lsofSummary = summarizeLsofLike(content);
+    if (lsofSummary) summary = capSummary(lsofSummary);
+  }
+
+  if (!summary) {
+    if (analysis.subtype === "search_results" || analysis.subtype === "api_response") {
+      summary = capSummary(syncTryJsonSummary(content, summaryBudget));
+    }
+
+    if (!summary && analysis.subtype === "error_output") {
+      const errorSummary = syncExtractErrors(content, tokens, summaryBudget);
+      if (errorSummary) {
+        summary = capSummary(errorSummary.content);
+      }
+    }
+
+    if (!summary && analysis.subtype === "file_listing") {
+      summary = capSummary(syncTryFileListingSummary(content));
+    }
+
+    if (!summary && analysis.subtype === "data_output") {
+      const domainSummary = syncDomainAware(content, tokens, "tool_output", activeConfig);
+      if (domainSummary) {
+        summary = capSummary(domainSummary.content);
+      } else {
+        summary = capSummary(syncTryJsonSummary(content, summaryBudget));
+      }
+    }
+  }
+
+  const representativeSamples = !summary
+    ? extractRepresentativeSamples(lines, 6)
+    : [];
+
+  const targetChars = Math.round(totalChars * 0.20);
+  const RATIO_PLACEHOLDER = "__RATIO__";
+  const parts: string[] = [];
+
+  parts.push(`\`[LAYERED RECALL] ${role} message: ${totalLines} lines, ${totalChars.toLocaleString()} chars → ~${targetChars.toLocaleString()} chars (${RATIO_PLACEHOLDER}% compression)\``);
+  parts.push("");
+
+  if (summary) {
+    parts.push("## Keypoint Summary");
+    parts.push(summary);
+    parts.push("");
+  }
+
+  if (representativeSamples.length > 0) {
+    parts.push("## Representative Samples");
+    for (const sample of representativeSamples) {
+      parts.push(`- ${sample}`);
+    }
+    parts.push("");
+  }
+
+  if (sections.length > 0) {
+    parts.push("## Section Index");
+    for (const section of sections) {
+      const marker = section.heading ? `**${section.heading}**` : "";
+      const range = `L${section.startLine}-L${section.endLine}`;
+      const sizeHint = section.chars > 5000
+        ? `(${(section.chars / 1000).toFixed(1)}K chars, large)`
+        : section.chars > 1000
+          ? `(${(section.chars / 1000).toFixed(1)}K chars)`
+          : `(${section.chars} chars)`;
+      if (marker) {
+        parts.push(`- ${range}: ${marker} — ${section.topic} ${sizeHint}`);
+      } else {
+        parts.push(`- ${range}: ${section.topic} ${sizeHint}`);
+      }
+    }
+    parts.push("");
+  }
+
+  parts.push("## Full-text Access");
+  if (sessionId) {
+    parts.push(`Session ID: \`${sessionId}\``);
+  }
+  if (timestamp) {
+    parts.push(`Timestamp: ${timestamp}`);
+  }
+  parts.push(`Original size: ${totalLines} lines, ${totalChars.toLocaleString()} chars`);
+  parts.push("To retrieve the full original content, use `read_file` on the session transcript with the line ranges from the Section Index above.");
+  parts.push("");
+
+  const rawEnvelope = parts.join("\n");
+  const envelopeTokens = estimateTokens(rawEnvelope);
+  const actualRatio = tokens > 0
+    ? ((1 - envelopeTokens / tokens) * 100).toFixed(1)
+    : "0.0";
+  const envelope = rawEnvelope.replace("__RATIO__", actualRatio);
+
+  return { envelope, rule: "layered-recall/message" };
+}
+
 // ── Plugin definition ───────────────────────────────────────────────────────
 
 const contextDistillerPlugin = {
@@ -1579,6 +2106,7 @@ const contextDistillerPlugin = {
   name: "Context Distiller",
   description: "Intelligent Part distillation — compresses verbose tool outputs, patches, and file content before context ingestion",
   version: "0.1.0",
+  kind: "context-engine",
 
   configSchema: {
     parse(value: unknown) {
@@ -1626,9 +2154,12 @@ const contextDistillerPlugin = {
     // is about to be persisted to the session transcript.
     //
     // CRITICAL: This hook is STRICTLY SYNCHRONOUS in Gateway. If a handler
-    // returns a Promise, it is silently ignored (see Gateway source line 5448).
-    // Therefore we use distillSync() which contains NO async/await/Promise.
-    api.on("tool_result_persist", (event, _ctx) => {
+    // returns a Promise, it is silently ignored. Therefore we use
+    // distillSync() which contains NO async/await/Promise.
+    //
+    // Uses api.on() which maps to registerTypedHook() internally, writing
+    // to registry.typedHooks consumed by the Gateway hook runner.
+    api.on("tool_result_persist", (event) => {
       if (!config.enabled) return;
 
       const message = event.message;
@@ -1664,7 +2195,7 @@ const contextDistillerPlugin = {
           const saved = tokens - result.tokens;
 
           // Update in-memory stats (session-scoped)
-          engine.recordHookDistillation(saved, result.rule);
+          engine.recordHookDistillation(tokens, saved, result.rule);
           // Update persistent stats (survives Gateway restarts)
           statsStore.recordDistillation(saved, result.rule);
 
@@ -1693,48 +2224,138 @@ const contextDistillerPlugin = {
       } catch (err) {
         log.error(`[distiller] tool_result_persist error: ${err instanceof Error ? err.message : String(err)}`);
       }
-    }, { priority: 50 }); // Run before other plugins that might process tool results
+    }, { priority: 50 });
 
     // ── Hook: before_message_write ──────────────────────────────────────
-    // Catches any remaining verbose content in messages
-    api.on("before_message_write", (event, _ctx) => {
+    // Two paths:
+    //   1. role=tool(toolResult)  → head+tail truncation (existing logic)
+    //   2. role=user/assistant    → layered recall: summary + section index + full-text pointer
+    // Uses api.on() → registerTypedHook() for typed hook registration.
+    api.on("before_message_write", (event, ctx) => {
       if (!config.enabled) return;
 
       const message = event.message;
-      if (!message || message.role !== "tool") return; // Only process tool messages
+      if (!message) return;
 
-      const content = typeof message.content === "string"
-        ? message.content
-        : "";
+      const role = message.role as string;
 
-      if (!content) return;
+      // ── Path 1: tool messages → head+tail truncation ──
+      if (role === "tool" || role === "toolResult") {
+        // Extract text content — support both string and array formats
+        let content = "";
+        if (typeof message.content === "string") {
+          content = message.content;
+        } else if (Array.isArray(message.content)) {
+          content = message.content
+            .filter((b: { type?: string; text?: string }) => b.type === "text" && b.text)
+            .map((b: { type?: string; text?: string }) => b.text!)
+            .join("\n");
+        }
 
-      const tokens = estimateTokens(content);
-      if (tokens <= config.toolOutputMaxTokens) return;
+        if (!content) return;
 
-      // Simple head+tail truncation for the sync hook
-      const lines = content.split("\n");
-      if (lines.length <= 20) return;
+        const tokens = estimateTokens(content);
+        if (tokens <= config.toolOutputMaxTokens) return;
 
-      const maxLines = 30;
-      if (lines.length > maxLines) {
-        const head = lines.slice(0, Math.ceil(maxLines * 0.6));
-        const tail = lines.slice(-Math.floor(maxLines * 0.4));
-        const truncated = [
-          ...head,
-          `\n[… ${lines.length - head.length - tail.length} lines omitted …]\n`,
-          ...tail,
-        ].join("\n");
+        // Use syncHeadTailTruncation for consistent token-budget-based truncation
+        const truncated = syncHeadTailTruncation(content, config.toolOutputMaxTokens);
+        const newTokens = estimateTokens(truncated);
 
-        return {
-          message: { ...message, content: truncated },
-        };
+        // Only return if we actually saved something meaningful (>5%)
+        if (newTokens >= tokens * 0.95) return;
+
+        if (typeof message.content === "string") {
+          return { message: { ...message, content: truncated } };
+        }
+        if (Array.isArray(message.content)) {
+          return {
+            message: {
+              ...message,
+              content: message.content.map((block: { type?: string; text?: string }) =>
+                block.type === "text" ? { ...block, text: truncated } : block,
+              ),
+            },
+          };
+        }
+        return;
+      }
+
+      // ── Path 2: user/assistant messages → layered recall ──
+      if (role === "user" || role === "assistant") {
+        // Extract text content (may be string or content blocks array)
+        let textContent = "";
+        if (typeof message.content === "string") {
+          textContent = message.content;
+        } else if (Array.isArray(message.content)) {
+          textContent = message.content
+            .filter((b: { type?: string; text?: string }) => b.type === "text" && b.text)
+            .map((b: { type?: string; text?: string }) => b.text!)
+            .join("\n");
+        }
+
+        if (!textContent) return;
+
+        const tokens = estimateTokens(textContent);
+        if (tokens <= config.messageMaxTokens) return;
+
+        // Apply layered recall
+        const result = syncLayeredRecall(
+          textContent,
+          role,
+          ctx?.sessionKey as string | undefined,  // sessionKey from ctx
+          (message as any).timestamp as string | undefined,  // timestamp from message
+          config,
+        );
+
+        if (!result) return;
+
+        const saved = tokens - estimateTokens(result.envelope);
+        if (saved <= 0) return; // No point if we didn't save anything
+
+        // Update stats
+        engine.recordHookDistillation(tokens, saved, result.rule);
+        statsStore.recordDistillation(saved, result.rule);
+
+        const ratio = ((1 - estimateTokens(result.envelope) / tokens) * 100).toFixed(1);
+        log.info(
+          `[distiller] layered-recall: ${tokens} → ${estimateTokens(result.envelope)} tokens ` +
+          `(saved ${saved}, ${ratio}%) [role=${role}]`,
+        );
+
+        // Return modified message
+        if (typeof message.content === "string") {
+          return {
+            message: { ...message, content: result.envelope },
+          };
+        }
+        if (Array.isArray(message.content)) {
+          // Replace only text blocks, preserve other block types (thinking, etc.)
+          const newContent = message.content.map((block: { type?: string; text?: string }) => {
+            if (block.type === "text") {
+              return { ...block, text: result.envelope };
+            }
+            return block;
+          });
+          // If no text block found, prepend one
+          const hasTextBlock = newContent.some((b: { type?: string }) => b.type === "text");
+          if (!hasTextBlock) {
+            newContent.unshift({ type: "text", text: result.envelope });
+          }
+          return {
+            message: {
+              ...message,
+              content: newContent,
+            },
+          };
+        }
       }
     }, { priority: 50 });
 
     // ── Register tools ──────────────────────────────────────────────────
-    api.registerTool(() => createDistillStatusTool(engine, statsStore));
-    api.registerTool(() => createDistillConfigureTool(engine));
+    // Use factory pattern to receive tool context (sessionId, agentId, etc.)
+    api.registerTool((_ctx) => createDistillStatusTool(engine, statsStore));
+    api.registerTool((_ctx) => createDistillConfigureTool(engine));
+    api.registerTool((_ctx) => testDistillerTool);
 
     // ── Log startup ─────────────────────────────────────────────────────
     const persistent = statsStore.getStats();
@@ -1753,3 +2374,12 @@ const contextDistillerPlugin = {
 };
 
 export default contextDistillerPlugin;
+
+// ── Test-only exports (not part of the public API) ──────────────────────────
+// These are used by the test suite to validate distillation behavior.
+export {
+  distillSync as _testDistillSync,
+  analyzeContent as _testAnalyzeContent,
+  syncHeadTailTruncation as _testSyncHeadTailTruncation,
+  syncLayeredRecall as _testSyncLayeredRecall,
+};

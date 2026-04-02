@@ -19,6 +19,21 @@ export interface DistillerConfig {
   patchMaxTokens: number;
   fileContentMaxTokens: number;
 
+  /**
+   * Token threshold for user/assistant messages.
+   * Messages exceeding this get layered-recall compression
+   * (summary + section index + full-text access pointer).
+   * Default: 3000 tokens (~6000 chars).
+   */
+  messageMaxTokens: number;
+
+  /**
+   * Maximum number of summary lines to extract for layered recall.
+   * Each "line" is a keypoint extracted from the original content.
+   * Default: 40 lines.
+   */
+  messageSummaryMaxLines: number;
+
   /** How aggressively to compress */
   aggressiveness: AggressivenessLevel;
 

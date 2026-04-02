@@ -11,6 +11,8 @@ const DEFAULTS: DistillerConfig = {
   toolOutputMaxTokens: 1200,
   patchMaxTokens: 600,
   fileContentMaxTokens: 1000,
+  messageMaxTokens: 3000,
+  messageSummaryMaxLines: 40,
   aggressiveness: "moderate",
   preservePatterns: [],
   distillModel: undefined,
@@ -19,7 +21,7 @@ const DEFAULTS: DistillerConfig = {
 
 const AGGRESSIVENESS_LEVELS: AggressivenessLevel[] = ["conservative", "moderate", "aggressive"];
 
-function parseInt(value: unknown, fallback: number): number {
+function toInt(value: unknown, fallback: number): number {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.round(value);
   }
@@ -78,17 +80,25 @@ export function resolveConfig(
 
   return {
     enabled,
-    toolOutputMaxTokens: parseInt(
+    toolOutputMaxTokens: toInt(
       env.CONTEXT_DISTILLER_TOOL_MAX_TOKENS ?? cfg.toolOutputMaxTokens,
       DEFAULTS.toolOutputMaxTokens,
     ),
-    patchMaxTokens: parseInt(
+    patchMaxTokens: toInt(
       env.CONTEXT_DISTILLER_PATCH_MAX_TOKENS ?? cfg.patchMaxTokens,
       DEFAULTS.patchMaxTokens,
     ),
-    fileContentMaxTokens: parseInt(
+    fileContentMaxTokens: toInt(
       env.CONTEXT_DISTILLER_FILE_MAX_TOKENS ?? cfg.fileContentMaxTokens,
       DEFAULTS.fileContentMaxTokens,
+    ),
+    messageMaxTokens: toInt(
+      env.CONTEXT_DISTILLER_MESSAGE_MAX_TOKENS ?? cfg.messageMaxTokens,
+      DEFAULTS.messageMaxTokens,
+    ),
+    messageSummaryMaxLines: toInt(
+      env.CONTEXT_DISTILLER_MESSAGE_SUMMARY_MAX_LINES ?? cfg.messageSummaryMaxLines,
+      DEFAULTS.messageSummaryMaxLines,
     ),
     aggressiveness,
     preservePatterns: parsePatterns(cfg.preservePatterns),

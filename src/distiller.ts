@@ -210,14 +210,20 @@ export class DistillerEngine {
   /**
    * Record a distillation performed by the sync hook (outside the async engine).
    * This updates the shared stats so distill_status shows accurate numbers.
+   *
+   * @param tokensBefore Token count before distillation (required for accurate ratio)
+   * @param tokensSaved  Tokens saved (tokensBefore - tokensAfter)
+   * @param rule         Which rule triggered the distillation
    */
-  recordHookDistillation(tokensSaved: number, rule: string): void {
+  recordHookDistillation(tokensBefore: number, tokensSaved: number, rule: string): void {
     this.stats.messagesProcessed++;
     this.stats.distillations++;
     this.stats.tokensSaved += tokensSaved;
     this.stats.ruleHits[rule] = (this.stats.ruleHits[rule] ?? 0) + 1;
     this.stats.lastDistilledAt = Date.now();
-    const ratio = 1 - (tokensSaved / Math.max(1, tokensSaved + 100));
+    // Accurate ratio: tokensAfter / tokensBefore
+    const tokensAfter = Math.max(0, tokensBefore - tokensSaved);
+    const ratio = tokensAfter / Math.max(1, tokensBefore);
     this.stats.avgCompressionRatio =
       this.stats.avgCompressionRatio * 0.9 + ratio * 0.1;
   }
