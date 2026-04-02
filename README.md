@@ -2,6 +2,8 @@
 
 Intelligent context compression for OpenClaw.
 
+**中文简介：** `context-distiller` 是一个 OpenClaw 上下文蒸馏插件，用来在冗长内容进入上下文窗口前先做智能压缩，尽量保留错误、摘要、结构化数据、关键路径和代表样本。中文说明见：[README.zh-CN.md](./README.zh-CN.md)
+
 `context-distiller` reduces token waste before verbose content enters the context window, while trying to preserve the signal that actually matters: errors, summaries, search results, structured data, file paths, and representative samples.
 
 It works across two major paths:
